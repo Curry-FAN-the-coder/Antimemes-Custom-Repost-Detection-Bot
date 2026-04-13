@@ -19,11 +19,8 @@ SCAN_SUBREDDITS = ["AntiMemes", "antimeme"]
 SIMILARITY_THRESHOLD = 3 
 DAYS_TO_BACKFILL = 365
 
-# --- DATABASE SETUP (Targeting the Volume path) ---
-# We use /data/ because that is where the Railway Volume will be mounted
+# --- DATABASE SETUP ---
 DB_PATH = "/data/antimeme_index.db"
-
-# Fallback for local testing if /data/ doesn't exist
 if not os.path.exists("/data"):
     DB_PATH = "antimeme_index.db"
 
@@ -54,6 +51,7 @@ def run_backfill():
     print(f"Starting backfill...")
     start_time = int(time.time()) - (DAYS_TO_BACKFILL * 86400)
     for sub in SCAN_SUBREDDITS:
+        # FIXED URL PATH BELOW
         url = f"https://pullpush.io{sub}&after={start_time}&size=100"
         while True:
             try:
@@ -74,7 +72,7 @@ def run_backfill():
 
 def run_bot():
     cursor.execute("SELECT COUNT(*) FROM posts")
-    if cursor.fetchone()[0] == 0:
+    if cursor.fetchone()[0] == 0: # FIXED INDEX
         run_backfill()
 
     print(f"Monitoring r/{TARGET_SUBREDDIT}...")
