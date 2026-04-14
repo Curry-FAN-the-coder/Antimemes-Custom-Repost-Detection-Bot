@@ -15,17 +15,19 @@ CLIENT_ID = os.environ.get('REDDIT_CLIENT_ID')
 CLIENT_SECRET = os.environ.get('REDDIT_SECRET')
 USERNAME = os.environ.get('REDDIT_USERNAME')
 PASSWORD = os.environ.get('REDDIT_PASSWORD')
-USER_AGENT = "Windows11:AntiMemes Repost Detection:v1.4 (by /u/Curry__Fan)"
+USER_AGENT = "Windows11:AntiMemes Repost Detection:v1.5 (by /u/Curry__Fan)"
 
 TARGET_SUBREDDIT = "AntiMemes"
+SCAN_SUBREDDITS = ["AntiMemes", "antimeme"]
 MONITOR_STR = "AntiMemes+antimeme"
-SIMILARITY_THRESHOLD = 3 
+
+SIMILARITY_THRESHOLD = 6 
 DB_PATH = "/data/antimeme_index.db" if os.path.exists("/data") else "antimeme_index.db"
 RETENTION_DAYS = 365
 
 # --- NETWORKING & DB ---
 session = requests.Session()
-retries = Retry(total=5, backoff_factor=1, status_forcelist=[502, 503, 504])
+retries = Retry(total=5, backoff_factor=2, status_forcelist=[429, 500, 502, 503, 504])
 session.mount('https://', HTTPAdapter(max_retries=retries))
 
 def get_db():
@@ -33,38 +35,26 @@ def get_db():
     conn.execute("CREATE TABLE IF NOT EXISTS posts (hash TEXT PRIMARY KEY, link TEXT, timestamp REAL)")
     return conn
 
-def cleanup_old_posts(cursor, db):
-    """Deletes entries older than RETENTION_DAYS."""
-    cutoff = time.time() - (RETENTION_DAYS * 86400)
-    cursor.execute("DELETE FROM posts WHERE timestamp < ?", (cutoff,))
-    deleted_count = cursor.rowcount
-    db.commit()
-    if deleted_count > 0:
-        print(f"[{datetime.now()}] Cleanup: Removed {deleted_count} old entries.")
-
-reddit = praw.Reddit(
-    client_id=CLIENT_ID, client_secret=CLIENT_SECRET,
-    password=PASSWORD, user_agent=USER_AGENT, username=USERNAME
-)
-
-# ... (get_image_hashes and check_for_repost functions remain the same) ...
-
-def get_image_hashes(submission):
+def get_image_hashes(url_or_submission):
+    """Universal hasher for both direct URLs (backfill) and submission objects (live)."""
     urls = []
-    if hasattr(submission, 'is_gallery') and submission.is_gallery:
-        for item in submission.gallery_data.get('items', []):
-            media_id = item['media_id']
-            if media_id in submission.media_metadata:
-                urls.append(submission.media_metadata[media_id]['s']['u'])
+    if isinstance(url_or_submission, str):
+        urls.append(url_or_submission)
     else:
-        urls.append(submission.url)
+        if hasattr(url_or_submission, 'is_gallery') and url_or_submission.is_gallery:
+            for item in url_or_submission.gallery_data.get('items', []):
+                media_id = item['media_id']
+                if media_id in url_or_submission.media_metadata:
+                    urls.append(url_or_submission.media_metadata[media_id]['s']['u'])
+        else:
+            urls.append(url_or_submission.url)
 
     hashes = []
     for url in urls:
         if not any(ext in url.lower() for ext in ['.jpg', '.jpeg', '.png', '.webp']):
             continue
         try:
-            response = session.get(url, timeout=15)
+            response = session.get(url, timeout=10)
             img = Image.open(BytesIO(response.content))
             if getattr(img, "is_animated", False):
                 img.seek(0)
@@ -72,6 +62,40 @@ def get_image_hashes(submission):
         except:
             continue
     return hashes
+
+def run_backfill(cursor, db):
+    """Option 2: Automatically populates the DB with the last 365 days of posts."""
+    print("Starting backfill process... This may take several hours.")
+    start_time = int(time.time()) - (RETENTION_DAYS * 86400)
+    
+    for sub in SCAN_SUBREDDITS:
+        print(f"Indexing historical posts from r/{sub}...")
+        # PullPush API endpoint
+        url = f"https://api.pullpush.io/reddit/search/submission/?subreddit={sub}&after={start_time}&size=100"
+        
+        while True:
+            try:
+                res = session.get(url, timeout=20).json()
+                data = res.get('data', [])
+                if not data:
+                    break
+                
+                for post in data:
+                    post_url = post.get('url', '')
+                    hashes = get_image_hashes(post_url)
+                    for h in hashes:
+                        cursor.execute("INSERT OR IGNORE INTO posts VALUES (?, ?, ?)", 
+                                     (h, post['permalink'], post['created_utc']))
+                
+                db.commit()
+                last_time = data[-1]['created_utc']
+                print(f"Indexed r/{sub} up to {datetime.fromtimestamp(last_time)}")
+                url = f"https://api.pullpush.io/reddit/search/submission/?subreddit={sub}&after={int(last_time)}&size=100"
+                time.sleep(1) # Respectful delay
+            except Exception as e:
+                print(f"Backfill batch failed: {e}. Moving to next sub or finishing.")
+                break
+    print("Backfill complete. Database is primed.")
 
 def check_for_repost(curr_hash_str, cursor):
     curr_hash = imagehash.hex_to_hash(curr_hash_str)
@@ -84,6 +108,8 @@ def check_for_repost(curr_hash_str, cursor):
 
 def get_mods(sub_name):
     try:
+        reddit = praw.Reddit(client_id=CLIENT_ID, client_secret=CLIENT_SECRET, 
+                             password=PASSWORD, user_agent=USER_AGENT, username=USERNAME)
         return {mod.name for mod in reddit.subreddit(sub_name).moderator()}
     except:
         return set()
@@ -92,26 +118,31 @@ def run_bot():
     db = get_db()
     cursor = db.cursor()
     
-    # Track the last day a cleanup was performed
-    last_cleanup_day = datetime.now().day
-    cleanup_old_posts(cursor, db) # Initial cleanup on start
+    # Check if we need to perform an initial backfill
+    cursor.execute("SELECT COUNT(*) FROM posts")
+    if cursor.fetchone()[0] == 0:
+        run_backfill(cursor, db)
     
+    reddit = praw.Reddit(client_id=CLIENT_ID, client_secret=CLIENT_SECRET, 
+                         password=PASSWORD, user_agent=USER_AGENT, username=USERNAME)
+    
+    last_cleanup_day = datetime.now().day
     mods = get_mods(TARGET_SUBREDDIT)
-    print(f"Monitoring {MONITOR_STR}...")
+    
+    print(f"Monitoring {MONITOR_STR} for new posts...")
 
     try:
         for submission in reddit.subreddit(MONITOR_STR).stream.submissions(skip_existing=True):
-            
-            # --- DAILY CLEANUP CHECK ---
+            # Daily Maintenance
             current_now = datetime.now()
             if current_now.day != last_cleanup_day:
-                print(f"New day detected ({current_now.date()}). Running scheduled cleanup...")
-                cleanup_old_posts(cursor, db)
-                last_cleanup_day = current_now.day
-                # Refresh mod list once a day too, just in case it changed
+                # Cleanup old hashes
+                cutoff = time.time() - (RETENTION_DAYS * 86400)
+                cursor.execute("DELETE FROM posts WHERE timestamp < ?", (cutoff,))
+                db.commit()
                 mods = get_mods(TARGET_SUBREDDIT)
+                last_cleanup_day = current_now.day
 
-            # --- NORMAL BOT LOGIC ---
             if submission.author and submission.author.name in mods:
                 continue
 
@@ -120,7 +151,6 @@ def run_bot():
 
             is_repost = False
             origin_link = None
-
             for h_str in hashes:
                 origin_link = check_for_repost(h_str, cursor)
                 if origin_link:
@@ -128,20 +158,16 @@ def run_bot():
                     break
 
             if is_repost and submission.subreddit.display_name.lower() == TARGET_SUBREDDIT.lower():
-                try:
-                    if submission.permalink != origin_link:
-                        submission.reply(f"Detected repost. Original here: https://reddit.com{origin_link}")
-                        submission.mod.remove()
-                        print(f"REMOVED: {submission.id}")
-                except Exception as e:
-                    print(f"Action Error: {e}")
+                if submission.permalink != origin_link:
+                    submission.reply(f"Detected repost. Original here: https://reddit.com{origin_link}")
+                    submission.mod.remove()
+                    print(f"REMOVED: {submission.id}")
 
             if not is_repost:
                 for h_str in hashes:
                     cursor.execute("INSERT OR IGNORE INTO posts VALUES (?, ?, ?)", 
                                  (h_str, submission.permalink, submission.created_utc))
                 db.commit()
-                print(f"INDEXED: {submission.id} from r/{submission.subreddit.display_name}")
 
     except Exception as e:
         print(f"Stream Error: {e}. Restarting...")
