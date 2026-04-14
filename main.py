@@ -21,7 +21,7 @@ TARGET_SUBREDDIT = "AntiMemes"
 SCAN_SUBREDDITS = ["AntiMemes", "antimeme"]
 MONITOR_STR = "AntiMemes+antimeme"
 
-SIMILARITY_THRESHOLD = 6 
+SIMILARITY_THRESHOLD = 4
 DB_PATH = "/data/antimeme_index.db" if os.path.exists("/data") else "antimeme_index.db"
 RETENTION_DAYS = 365
 
