@@ -11,17 +11,19 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 # --- CONFIGURATION ---
+# These are pulled from Railway Environment Variables
 CLIENT_ID = os.environ.get('REDDIT_CLIENT_ID')
 CLIENT_SECRET = os.environ.get('REDDIT_SECRET')
-USERNAME = os.environ.get('REDDIT_USERNAME')
-PASSWORD = os.environ.get('REDDIT_PASSWORD')
-USER_AGENT = "Windows11:AntiMemes Repost Detection:v1.5 (by /u/Curry__Fan)"
+REFRESH_TOKEN = os.environ.get('REDDIT_REFRESH_TOKEN')
+# Update the 'by /u/...' to your main account username
+USER_AGENT = "script:AntiMemes Repost Detection:v1.5 (by /u/Curry__Fan)"
 
 TARGET_SUBREDDIT = "AntiMemes"
 SCAN_SUBREDDITS = ["AntiMemes", "antimeme"]
 MONITOR_STR = "AntiMemes+antimeme"
 
 SIMILARITY_THRESHOLD = 4
+# Path optimized for Railway Volume mount at /data
 DB_PATH = "/data/antimeme_index.db" if os.path.exists("/data") else "antimeme_index.db"
 RETENTION_DAYS = 365
 
@@ -31,12 +33,21 @@ retries = Retry(total=5, backoff_factor=2, status_forcelist=[429, 500, 502, 503,
 session.mount('https://', HTTPAdapter(max_retries=retries))
 
 def get_db():
+    """Initializes the database in the persistent /data directory."""
     conn = sqlite3.connect(DB_PATH)
     conn.execute("CREATE TABLE IF NOT EXISTS posts (hash TEXT PRIMARY KEY, link TEXT, timestamp REAL)")
     return conn
 
+def get_reddit_instance():
+    """Creates a PRAW instance using the Refresh Token (No password needed)."""
+    return praw.Reddit(
+        client_id=CLIENT_ID,
+        client_secret=CLIENT_SECRET,
+        refresh_token=REFRESH_TOKEN,
+        user_agent=USER_AGENT
+    )
+
 def get_image_hashes(url_or_submission):
-    """Universal hasher for both direct URLs (backfill) and submission objects (live)."""
     urls = []
     if isinstance(url_or_submission, str):
         urls.append(url_or_submission)
@@ -64,13 +75,11 @@ def get_image_hashes(url_or_submission):
     return hashes
 
 def run_backfill(cursor, db):
-    """Option 2: Automatically populates the DB with the last 365 days of posts."""
     print("Starting backfill process... This may take several hours.")
     start_time = int(time.time()) - (RETENTION_DAYS * 86400)
     
     for sub in SCAN_SUBREDDITS:
         print(f"Indexing historical posts from r/{sub}...")
-        # PullPush API endpoint
         url = f"https://api.pullpush.io/reddit/search/submission/?subreddit={sub}&after={start_time}&size=100"
         
         while True:
@@ -91,9 +100,9 @@ def run_backfill(cursor, db):
                 last_time = data[-1]['created_utc']
                 print(f"Indexed r/{sub} up to {datetime.fromtimestamp(last_time)}")
                 url = f"https://api.pullpush.io/reddit/search/submission/?subreddit={sub}&after={int(last_time)}&size=100"
-                time.sleep(1) # Respectful delay
+                time.sleep(1) 
             except Exception as e:
-                print(f"Backfill batch failed: {e}. Moving to next sub or finishing.")
+                print(f"Backfill batch failed: {e}. Finishing sub.")
                 break
     print("Backfill complete. Database is primed.")
 
@@ -106,10 +115,8 @@ def check_for_repost(curr_hash_str, cursor):
             return old_link
     return None
 
-def get_mods(sub_name):
+def get_mods(reddit, sub_name):
     try:
-        reddit = praw.Reddit(client_id=CLIENT_ID, client_secret=CLIENT_SECRET, 
-                             password=PASSWORD, user_agent=USER_AGENT, username=USERNAME)
         return {mod.name for mod in reddit.subreddit(sub_name).moderator()}
     except:
         return set()
@@ -118,29 +125,27 @@ def run_bot():
     db = get_db()
     cursor = db.cursor()
     
-    # Check if we need to perform an initial backfill
+    # Initial Backfill check
     cursor.execute("SELECT COUNT(*) FROM posts")
     if cursor.fetchone()[0] == 0:
         run_backfill(cursor, db)
     
-    reddit = praw.Reddit(client_id=CLIENT_ID, client_secret=CLIENT_SECRET, 
-                         password=PASSWORD, user_agent=USER_AGENT, username=USERNAME)
+    reddit = get_reddit_instance()
+    print(f"Authenticated as: {reddit.user.me()}")
     
     last_cleanup_day = datetime.now().day
-    mods = get_mods(TARGET_SUBREDDIT)
+    mods = get_mods(reddit, TARGET_SUBREDDIT)
     
     print(f"Monitoring {MONITOR_STR} for new posts...")
 
     try:
         for submission in reddit.subreddit(MONITOR_STR).stream.submissions(skip_existing=True):
-            # Daily Maintenance
             current_now = datetime.now()
             if current_now.day != last_cleanup_day:
-                # Cleanup old hashes
                 cutoff = time.time() - (RETENTION_DAYS * 86400)
                 cursor.execute("DELETE FROM posts WHERE timestamp < ?", (cutoff,))
                 db.commit()
-                mods = get_mods(TARGET_SUBREDDIT)
+                mods = get_mods(reddit, TARGET_SUBREDDIT)
                 last_cleanup_day = current_now.day
 
             if submission.author and submission.author.name in mods:
@@ -170,7 +175,7 @@ def run_bot():
                 db.commit()
 
     except Exception as e:
-        print(f"Stream Error: {e}. Restarting...")
+        print(f"Stream Error: {e}. Restarting in 60s...")
         time.sleep(60)
         run_bot()
 
